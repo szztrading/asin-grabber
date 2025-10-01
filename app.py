@@ -138,11 +138,11 @@ def _scrape_related_asins_from_dp(asin, domain="amazon.co.uk", max_items=100):
 
 def _keepa_fetch_related(asin, domain="amazon.co.uk", api_key=None, max_items=200):
     """
-    使用 Keepa SDK 获取 alsoBought/alsoViewed/related 等关联 ASIN（更稳、更兼容）。
-    兼容多种 keepa.query() 调用签名：asin= / asins=[...] / product=
+    使用 Keepa SDK 获取 alsoBought/alsoViewed/related 等关联 ASIN（兼容 1.3+ 版本）。
+    ✅ 仅使用 asins=[...] 调用，确保兼容你当前版本 (1.3.15)
     """
     try:
-        import keepa, inspect
+        import keepa
     except Exception:
         return [], "Keepa SDK 未安装（requirements.txt 需包含 keepa>=1.3.0），已回退 HTML 解析模式。"
 
@@ -151,26 +151,23 @@ def _keepa_fetch_related(asin, domain="amazon.co.uk", api_key=None, max_items=20
 
     try:
         api = keepa.Keepa(api_key)
-        domain_map = {"amazon.co.uk": 2, "amazon.com": 1, "amazon.de": 3, "amazon.fr": 8, "amazon.it": 10, "amazon.es": 9}
+        domain_map = {
+            "amazon.co.uk": 2,
+            "amazon.com": 1,
+            "amazon.de": 3,
+            "amazon.fr": 8,
+            "amazon.it": 10,
+            "amazon.es": 9
+        }
         dom = domain_map.get(domain, 2)
 
-        # --- 兼容调用：优先 asin=，再 asins=[...], 再 product= ---
-        products = None
-        try:
-            # 方式1：asin=（较新版本常用）
-            products = api.query(asin=asin, domain=dom, history=False)
-        except TypeError:
-            try:
-                # 方式2：asins=[...]（很多版本都支持）
-                products = api.query(asins=[asin], domain=dom, history=False)
-            except TypeError:
-                # 方式3：product=（老版本）
-                products = api.query(product=asin, domain=dom, history=False)
+        # ✅ 最稳定的调用方式
+        products = api.query(asins=[asin], domain=dom, history=False)
 
         if not products:
             return [], "Keepa 未返回产品，已回退 HTML 解析模式。"
 
-        # products 可能是 list 或 dict，统一取第一项
+        # 统一取第一个产品
         p = products[0] if isinstance(products, list) else products
 
         related = set()
@@ -184,9 +181,8 @@ def _keepa_fetch_related(asin, domain="amazon.co.uk", api_key=None, max_items=20
         related.discard(asin.upper())
         out = list(related)[:max_items]
 
-        # 如果一个都没有，给出提醒，方便你判断是否走回退
         if not out:
-            return out, "Keepa 已连接，但此 ASIN 未返回关联列表（可能是新品或数据不足）。"
+            return out, "Keepa 已连接，但未返回关联 ASIN（可能是新品或无数据）。"
 
         return out, None
 
