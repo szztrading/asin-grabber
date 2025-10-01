@@ -138,11 +138,11 @@ def _scrape_related_asins_from_dp(asin, domain="amazon.co.uk", max_items=100):
 
 def _keepa_fetch_related(asin, domain="amazon.co.uk", api_key=None, max_items=200):
     """
-    使用 Keepa SDK 获取 alsoBought/alsoViewed/related 等关联 ASIN（更稳、更全）。
-    需要：pip install keepa；并在 Secrets/环境变量提供 api_key。
+    使用 Keepa SDK 获取 alsoBought/alsoViewed/related 等关联 ASIN（更稳、更兼容）。
+    兼容多种 keepa.query() 调用签名：asin= / asins=[...] / product=
     """
     try:
-        import keepa
+        import keepa, inspect
     except Exception:
         return [], "Keepa SDK 未安装（requirements.txt 需包含 keepa>=1.3.0），已回退 HTML 解析模式。"
 
@@ -153,10 +153,26 @@ def _keepa_fetch_related(asin, domain="amazon.co.uk", api_key=None, max_items=20
         api = keepa.Keepa(api_key)
         domain_map = {"amazon.co.uk": 2, "amazon.com": 1, "amazon.de": 3, "amazon.fr": 8, "amazon.it": 10, "amazon.es": 9}
         dom = domain_map.get(domain, 2)
-        products = api.query(asin=asin, domain=dom, history=False)
+
+        # --- 兼容调用：优先 asin=，再 asins=[...], 再 product= ---
+        products = None
+        try:
+            # 方式1：asin=（较新版本常用）
+            products = api.query(asin=asin, domain=dom, history=False)
+        except TypeError:
+            try:
+                # 方式2：asins=[...]（很多版本都支持）
+                products = api.query(asins=[asin], domain=dom, history=False)
+            except TypeError:
+                # 方式3：product=（老版本）
+                products = api.query(product=asin, domain=dom, history=False)
+
         if not products:
             return [], "Keepa 未返回产品，已回退 HTML 解析模式。"
-        p = products[0]
+
+        # products 可能是 list 或 dict，统一取第一项
+        p = products[0] if isinstance(products, list) else products
+
         related = set()
         for k in ("alsoBought", "alsoViewed", "frequentlyBoughtTogether", "related"):
             arr = p.get(k) or []
@@ -164,8 +180,16 @@ def _keepa_fetch_related(asin, domain="amazon.co.uk", api_key=None, max_items=20
                 xu = str(x).upper()
                 if re.fullmatch(r"B0[A-Z0-9]{8}", xu):
                     related.add(xu)
+
         related.discard(asin.upper())
-        return list(related)[:max_items], None
+        out = list(related)[:max_items]
+
+        # 如果一个都没有，给出提醒，方便你判断是否走回退
+        if not out:
+            return out, "Keepa 已连接，但此 ASIN 未返回关联列表（可能是新品或数据不足）。"
+
+        return out, None
+
     except Exception as e:
         return [], f"Keepa 查询失败（{e}），已回退 HTML 解析模式。"
 
