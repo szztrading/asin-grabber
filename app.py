@@ -5,6 +5,52 @@ import pandas as pd
 import streamlit as st
 from bs4 import BeautifulSoup
 from datetime import datetime
+import requests
+
+# 读取 API Key
+API_KEY = st.secrets["keepa"]["api_key"]
+
+def search_products_by_keyword(keyword, domain=3, page=0):
+    """调用 Keepa 搜索功能，抓取关键词下的竞品 ASIN"""
+    url = "https://api.keepa.com/query"
+    params = {
+        "key": API_KEY,
+        "domain": domain,  # 3 = UK, 1 = US, 4 = DE ...
+        "type": "product",
+        "term": keyword,
+        "page": page
+    }
+    res = requests.get(url, params=params).json()
+    if "products" not in res:
+        st.error("❌ Keepa 返回错误: " + str(res))
+        return pd.DataFrame()
+    
+    # 解析数据
+    products = []
+    for p in res["products"]:
+        products.append({
+            "ASIN": p.get("asin"),
+            "Title": p.get("title"),
+            "Brand": p.get("brand"),
+            "Category": p.get("rootCategory"),
+            "BuyBoxPrice": p.get("buyBoxPrice"),
+            "SalesRank": p.get("salesRankDrops30"),  # 30天销量排名波动（越多越好）
+        })
+    return pd.DataFrame(products)
+
+# 📊 Streamlit UI
+st.title("🔎 Keepa 竞品分析模块")
+
+keyword = st.text_input("输入关键词（例如：airlock 或 brewing heat pad）")
+
+if st.button("抓取竞品"):
+    if not keyword:
+        st.warning("请输入关键词")
+    else:
+        df = search_products_by_keyword(keyword)
+        st.dataframe(df)
+        st.download_button("⬇️ 下载 CSV", df.to_csv(index=False), "keepa_results.csv")
+
 
 st.set_page_config(page_title="Competitor ASIN Grabber", layout="wide")
 st.title("🕵️ Competitor ASIN Grabber")
