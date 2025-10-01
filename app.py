@@ -1,6 +1,9 @@
-# app.py — Competitor ASIN Grabber (Keepa REST + HTML fallback)
-# 功能：输入一个竞品 ASIN → 通过 Keepa REST（优先）或 HTML 回退抓取 alsoBought/alsoViewed/related ASIN
-# 输出：尽量补全 标题/价格/评分/评论/链接 → 支持 CSV 下载
+# app.py — Competitor ASIN Grabber (Keepa REST + HTML fallback + Relevance Scoring)
+# 功能：
+# 1) 输入竞品 ASIN → 通过 Keepa REST（优先）或 HTML 回退抓取 alsoBought/alsoViewed/related ASIN
+# 2) 为每个 ASIN 尽量补全 Title/Price/Rating/Reviews/URL
+# 3) 相关性打分 + 过滤（包含/排除词、价格、评分、评论阈值）
+# 4) 导出两个 CSV：全量抓取、已过滤推荐
 
 import os
 import re
@@ -9,27 +12,23 @@ import requests
 import pandas as pd
 import streamlit as st
 from bs4 import BeautifulSoup
-from datetime import datetime
-  # NOTE: If this line errors, replace with: from datetime import datetime
+from datetime import datetime  # ✅ 正确导入
 
-# ------------- 基本设置 -------------
+# ---------------- 基本设置 ----------------
 st.set_page_config(page_title="Competitor ASIN Grabber", layout="wide")
 st.title("🕵️ Competitor ASIN Grabber")
 st.caption("""
-输入一个竞品 ASIN（如 B0D4QMBS75），抓取该商品详情页关联推荐（alsoBought / alsoViewed / related），
-并尽量补全标题/价格/评分/评论，最后导出 CSV。
-
-✅ 若配置了 Keepa（Secrets 中设置 `KEEPA_API_KEY` 或 `[keepa].api_key`），将优先调用 Keepa **REST API**；
-❇️ 未配置或失败时自动回退到 HTML 解析模式。
+输入一个竞品 ASIN（如 B0D4QMBS75），抓取该商品详情页的 alsoBought / alsoViewed / related，并尽量补全标题/价格/评分/评论。
+✅ 若配置 Keepa（Secrets: `KEEPA_API_KEY` 或 `[keepa].api_key`），优先使用 Keepa REST；失败或未配置将回退 HTML 解析。
 """)
 
-# ------------- 读取 Keepa Key（兼容多种写法） -------------
+# ---------------- 读取 Keepa Key（兼容多种写法） ----------------
 def get_keepa_key() -> str:
     """
-    读取 Keepa API Key（优先 secrets，其次环境变量），兼容两种 secrets 写法：
-    1) KEEPA_API_KEY = "..."
-    2) [keepa]
-       api_key = "..."
+    读取 Keepa API Key（优先 secrets，其次环境变量）。
+    支持两种 secrets 写法：
+      1) KEEPA_API_KEY = "..."
+      2) [keepa] \n api_key = "..."
     """
     try:
         key = (
@@ -37,13 +36,13 @@ def get_keepa_key() -> str:
             (st.secrets.get("keepa", {}) or {}).get("api_key", "") or
             os.environ.get("KEEPA_API_KEY", "")
         )
-        return key.strip()
+        return (key or "").strip()
     except Exception:
-        return os.environ.get("KEEPA_API_KEY", "").strip()
+        return (os.environ.get("KEEPA_API_KEY", "") or "").strip()
 
 KEEPA_KEY = get_keepa_key()
 
-# ------------- 小工具函数 -------------
+# ---------------- 工具函数 ----------------
 def _format_price(txt):
     if txt is None:
         return None
@@ -56,7 +55,7 @@ def _format_price(txt):
 def _fetch_mobile_product_snapshot(asin, domain="amazon.co.uk"):
     """
     访问亚马逊移动简页，尽量取到：标题/价格/星级/评论数。
-    仅做补充，不保证100%获取（失败也返回基本结构）。
+    失败时也返回基本结构以保证流水线不中断。
     """
     url = f"https://{domain}/gp/aw/d/{asin}"
     headers = {
@@ -136,10 +135,10 @@ def _scrape_related_asins_from_dp(asin, domain="amazon.co.uk", max_items=120):
     except Exception:
         return []
 
-# ------------- Keepa REST：获取关联 ASIN -------------
+# ---------------- Keepa REST：获取关联 ASIN ----------------
 def _keepa_fetch_related_rest(asin, domain="amazon.co.uk", api_key=None, max_items=200):
     """
-    ✅ 直接使用 Keepa REST API，不依赖第三方 keepa SDK。兼容性最好。
+    直接使用 Keepa REST API，不依赖 keepa SDK。兼容性最好。
     返回：([ASIN...], 错误/提示消息或 None)
     """
     if not api_key:
@@ -168,17 +167,16 @@ def _keepa_fetch_related_rest(asin, domain="amazon.co.uk", api_key=None, max_ite
         data = r.json()
 
         if "error" in data and data["error"]:
-            # 返回 Keepa 的错误信息
             return [], f"Keepa API 错误: {data['error']}"
 
         if "products" not in data or not data["products"]:
-            return [], "Keepa 返回为空，可能 ASIN 无数据/错误或数据不足。"
+            return [], "Keepa 返回为空，可能 ASIN 无数据或数据不足。"
 
         p = data["products"][0]
         related = set()
 
         for k in ("alsoBought", "alsoViewed", "frequentlyBoughtTogether", "related"):
-            for x in p.get(k, []) or []:
+            for x in (p.get(k, []) or []):
                 xu = str(x).upper()
                 if re.fullmatch(r"B0[A-Z0-9]{8}", xu):
                     related.add(xu)
@@ -194,7 +192,89 @@ def _keepa_fetch_related_rest(asin, domain="amazon.co.uk", api_key=None, max_ite
     except Exception as e:
         return [], f"Keepa API 请求失败：{e}"
 
-# ------------- UI -------------
+# ---------------- 相关性打分 + 过滤 ----------------
+def score_and_filter(df: pd.DataFrame,
+                     include_terms=None,
+                     exclude_terms=None,
+                     price_min=None,
+                     price_max=None,
+                     rating_min=None,
+                     reviews_min=None):
+    """
+    对抓到的 ASIN 做“相关性打分 + 过滤”
+    规则：
+      - 标题命中 include_terms 加分（多命中多加）
+      - 命中 exclude_terms 直接剔除
+      - 价格/评分/评论阈值过滤（不达标剔除）
+    返回：df_kept（含 RelevanceScore）、df_dropped（被剔除项）
+    """
+    if df is None or df.empty:
+        return df, pd.DataFrame()
+
+    work = df.copy()
+    # 规范化
+    work["title"] = work.get("title", "").fillna("").astype(str).str.lower()
+
+    def contains_any(text, terms):
+        text = text or ""
+        for t in (terms or []):
+            t = t.strip().lower()
+            if not t:
+                continue
+            if t in text:
+                return True
+        return False
+
+    include_terms = [t.strip().lower() for t in (include_terms or []) if t.strip()]
+    exclude_terms = [t.strip().lower() for t in (exclude_terms or []) if t.strip()]
+
+    scores, drops_mask = [], []
+    for _, row in work.iterrows():
+        title = row.get("title", "")
+
+        # 1) 命中排除词 → 丢弃
+        if contains_any(title, exclude_terms):
+            scores.append(0)
+            drops_mask.append(True)
+            continue
+
+        # 2) include 计分
+        score = 0
+        for t in include_terms:
+            if t in title:
+                score += 1
+
+        # 3) 阈值过滤
+        price = row.get("price", None)
+        rating = row.get("rating", None)
+        reviews = row.get("reviews", None)
+
+        drop = False
+        if price_min is not None and isinstance(price, (int, float)) and price < price_min:
+            drop = True
+        if price_max is not None and isinstance(price, (int, float)) and price > price_max:
+            drop = True
+        if rating_min is not None and (rating is None or (isinstance(rating, (int, float)) and rating < rating_min)):
+            drop = True
+        if reviews_min is not None and (reviews is None or (isinstance(reviews, (int, float)) and reviews < reviews_min)):
+            drop = True
+
+        drops_mask.append(drop)
+        scores.append(score)
+
+    work["RelevanceScore"] = scores
+    dropped = work.loc[drops_mask].copy()
+
+    kept = work.loc[[not x for x in drops_mask]].copy()
+    kept = kept.sort_values(
+        by=["RelevanceScore", "reviews", "rating"],
+        ascending=[False, False, False],
+        kind="mergesort"
+    )
+
+    return kept, dropped
+
+# ---------------- UI：输入区 ----------------
 with st.container():
     cols = st.columns([1,1,1,1])
     with cols[0]:
@@ -208,6 +288,22 @@ with st.container():
 
 st.caption(f"🔐 Keepa Key 状态：{'✅ 已检测到' if KEEPA_KEY else '❌ 未配置，将使用 HTML 回退'}")
 
+# ---------------- UI：相关性过滤器 ----------------
+with st.expander("🧠 相关性过滤器（建议开启）", expanded=True):
+    default_includes = "brew, brewing, airlock, ferment, demijohn, bung, grommet, wine, cider, mead, kombucha, heat belt, heat mat, heat pad, fermentation"
+    default_excludes = "reptile, terrarium, seed, seedling, plant, pet, dog, cat, car, 12v, water tank, aquarium, vivarium, sous vide, coffee, tea pot"
+
+    colf1, colf2 = st.columns(2)
+    with colf1:
+        include_terms_str = st.text_input("包含关键词（命中加分，逗号分隔）", value=default_includes)
+        price_min = st.number_input("最低价格(£)", min_value=0.0, value=10.0, step=0.5)
+        rating_min = st.number_input("最低评分", min_value=0.0, max_value=5.0, value=3.8, step=0.1)
+    with colf2:
+        exclude_terms_str = st.text_input("排除关键词（命中直接剔除，逗号分隔）", value=default_excludes)
+        price_max = st.number_input("最高价格(£)", min_value=0.0, value=60.0, step=0.5)
+        reviews_min = st.number_input("最低评论数", min_value=0, value=20, step=5)
+
+# ---------------- 动作 ----------------
 if st.button("🚀 开始抓取", use_container_width=True):
     # 校验 ASIN 格式
     if not re.fullmatch(r"[Bb]0[A-Za-z0-9]{8}", seed_asin or ""):
@@ -215,9 +311,8 @@ if st.button("🚀 开始抓取", use_container_width=True):
         st.stop()
     seed_asin = seed_asin.upper()
 
-    related_asins, msg = [], None
-
     # 1) Keepa REST 优先
+    related_asins, msg = [], None
     if prefer_keepa and KEEPA_KEY:
         with st.status("🔗 正在通过 Keepa REST 获取关联 ASIN …", expanded=False):
             related_asins, msg = _keepa_fetch_related_rest(seed_asin, domain=domain, api_key=KEEPA_KEY, max_items=max_items)
@@ -244,19 +339,40 @@ if st.button("🚀 开始抓取", use_container_width=True):
     progress.empty()
 
     df = pd.DataFrame(rows, columns=["asin","title","price","rating","reviews","url"])
-    st.success(f"抓取完成：共 {len(df)} 条。")
-    st.dataframe(df, use_container_width=True)
 
-    # 4) 导出 CSV
-    csv_data = df.to_csv(index=False).encode("utf-8-sig")
-    today = datetime.now().strftime("%Y%m%d")
-    st.download_button(
-        "📥 下载 CSV",
-        data=csv_data,
-        file_name=f"asin_competitors_{seed_asin}_{today}.csv",
-        mime="text/csv",
-        use_container_width=True
+    # 4) 相关性打分 + 过滤
+    include_terms = [x.strip() for x in include_terms_str.split(",")]
+    exclude_terms = [x.strip() for x in exclude_terms_str.split(",")]
+    kept, dropped = score_and_filter(
+        df,
+        include_terms=include_terms,
+        exclude_terms=exclude_terms,
+        price_min=price_min, price_max=price_max,
+        rating_min=rating_min, reviews_min=reviews_min
     )
 
+    st.success(f"抓取完成：共 {len(df)} 条，过滤后建议投放 {len(kept)} 条，剔除 {len(dropped)} 条。")
+    st.subheader("✅ 建议投放（已按相关性得分排序）")
+    st.dataframe(kept, use_container_width=True)
+
+    with st.expander("🗃️ 被剔除（供复核）"):
+        st.dataframe(dropped, use_container_width=True)
+
+    # 5) 导出 CSV（全量 & 已过滤）
+    csv_full = df.to_csv(index=False).encode("utf-8-sig")
+    csv_kept = kept.to_csv(index=False).encode("utf-8-sig")
+    today = datetime.now().strftime("%Y%m%d")
+
+    st.download_button("📥 下载【全量抓取】CSV",
+                       data=csv_full,
+                       file_name=f"asin_competitors_full_{seed_asin}_{today}.csv",
+                       mime="text/csv",
+                       use_container_width=True)
+    st.download_button("✅ 下载【已过滤推荐】CSV",
+                       data=csv_kept,
+                       file_name=f"asin_competitors_filtered_{seed_asin}_{today}.csv",
+                       mime="text/csv",
+                       use_container_width=True)
+
 st.markdown("---")
-st.caption("提示：Keepa REST 更稳定，不受第三方 SDK 影响；未配置 Keepa 时将使用 HTML 回退，抓取率可能受页面结构影响。")
+st.caption("提示：Keepa REST 更稳定；未配置 Keepa 时使用 HTML 回退可能抓到赞助位/跨类目，建议使用上方相关性过滤器收敛。")
