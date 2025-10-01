@@ -5,7 +5,7 @@ import pandas as pd
 import streamlit as st
 from bs4 import BeautifulSoup
 from datetime import datetime
-import requests
+
 
 st.write("Secrets keys loaded:", st.secrets.keys())
 
