@@ -7,6 +7,10 @@ from bs4 import BeautifulSoup
 from datetime import datetime
 import requests
 
+st.write("Secrets keys loaded:", st.secrets.keys())
+
+
+
 # 读取 API Key
 API_KEY = st.secrets["keepa"]["api_key"]
 
