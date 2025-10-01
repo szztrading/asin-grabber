@@ -1,32 +1,31 @@
-# app.py — Competitor ASIN Grabber (Streamlit standalone, fixed)
-# 功能：输入一个竞品 ASIN → 通过 Keepa（优先）或 HTML 回退抓取 alsoBought/alsoViewed/related ASIN
+# app.py — Competitor ASIN Grabber (Keepa REST + HTML fallback)
+# 功能：输入一个竞品 ASIN → 通过 Keepa REST（优先）或 HTML 回退抓取 alsoBought/alsoViewed/related ASIN
 # 输出：尽量补全 标题/价格/评分/评论/链接 → 支持 CSV 下载
 
 import os
 import re
+import json
 import requests
 import pandas as pd
 import streamlit as st
 from bs4 import BeautifulSoup
-from datetime import datetime
+from datetimeClass import datetime  # NOTE: If this line errors, replace with: from datetime import datetime
 
-import keepa
-st.write("Keepa 版本：", keepa.__version__)
-
+# ------------- 基本设置 -------------
 st.set_page_config(page_title="Competitor ASIN Grabber", layout="wide")
 st.title("🕵️ Competitor ASIN Grabber")
 st.caption("""
-输入一个竞品 ASIN（如 B0D4QMBS75），抓取该商品详情页的相似/相关推荐位的 ASIN，
+输入一个竞品 ASIN（如 B0D4QMBS75），抓取该商品详情页关联推荐（alsoBought / alsoViewed / related），
 并尽量补全标题/价格/评分/评论，最后导出 CSV。
 
-✅ 若配置了 Keepa（Secrets 中设置 `KEEPA_API_KEY` 或 `[keepa].api_key`），将优先通过 Keepa 获取 alsoBought/alsoViewed/related；
-❇️ 未配置 Keepa 时会自动回退到 HTML 解析模式。
+✅ 若配置了 Keepa（Secrets 中设置 `KEEPA_API_KEY` 或 `[keepa].api_key`），将优先调用 Keepa **REST API**；
+❇️ 未配置或失败时自动回退到 HTML 解析模式。
 """)
 
-# ----------------- Keepa Key 读取（兼容多种写法） -----------------
+# ------------- 读取 Keepa Key（兼容多种写法） -------------
 def get_keepa_key() -> str:
     """
-    读取 Keepa API Key（优先 secrets，其次环境变量），支持两种 secrets 写法：
+    读取 Keepa API Key（优先 secrets，其次环境变量），兼容两种 secrets 写法：
     1) KEEPA_API_KEY = "..."
     2) [keepa]
        api_key = "..."
@@ -43,7 +42,7 @@ def get_keepa_key() -> str:
 
 KEEPA_KEY = get_keepa_key()
 
-# ----------------- 工具函数 -----------------
+# ------------- 小工具函数 -------------
 def _format_price(txt):
     if txt is None:
         return None
@@ -56,7 +55,7 @@ def _format_price(txt):
 def _fetch_mobile_product_snapshot(asin, domain="amazon.co.uk"):
     """
     访问亚马逊移动简页，尽量取到：标题/价格/星级/评论数。
-    仅做补充，不保证100%获取（回退也会返回基本结构）。
+    仅做补充，不保证100%获取（失败也返回基本结构）。
     """
     url = f"https://{domain}/gp/aw/d/{asin}"
     headers = {
@@ -64,7 +63,7 @@ def _fetch_mobile_product_snapshot(asin, domain="amazon.co.uk"):
         "Accept-Language": "en-GB,en;q=0.9",
     }
     try:
-        r = requests.get(url, headers=headers, timeout=12)
+        r = requests.get(url, headers=headers, timeout=15)
         if r.status_code != 200:
             return {"asin": asin, "title": None, "price": None, "rating": None, "reviews": None, "url": f"https://{domain}/dp/{asin}"}
         soup = BeautifulSoup(r.text, "html.parser")
@@ -100,7 +99,7 @@ def _fetch_mobile_product_snapshot(asin, domain="amazon.co.uk"):
     except Exception:
         return {"asin": asin, "title": None, "price": None, "rating": None, "reviews": None, "url": f"https://{domain}/dp/{asin}"}
 
-def _scrape_related_asins_from_dp(asin, domain="amazon.co.uk", max_items=100):
+def _scrape_related_asins_from_dp(asin, domain="amazon.co.uk", max_items=120):
     """
     直接抓取竞品详情页，解析推荐位里的 ASIN（sponsored/related/also viewed 等）。
     作为 Keepa 不可用时的回退方案。
@@ -111,7 +110,7 @@ def _scrape_related_asins_from_dp(asin, domain="amazon.co.uk", max_items=100):
         "Accept-Language": "en-GB,en;q=0.9",
     }
     try:
-        r = requests.get(url, headers=headers, timeout=12)
+        r = requests.get(url, headers=headers, timeout=15)
         if r.status_code != 200:
             return []
         soup = BeautifulSoup(r.text, "html.parser")
@@ -136,44 +135,49 @@ def _scrape_related_asins_from_dp(asin, domain="amazon.co.uk", max_items=100):
     except Exception:
         return []
 
-def _keepa_fetch_related(asin, domain="amazon.co.uk", api_key=None, max_items=200):
+# ------------- Keepa REST：获取关联 ASIN -------------
+def _keepa_fetch_related_rest(asin, domain="amazon.co.uk", api_key=None, max_items=200):
     """
-    使用 Keepa SDK 获取 alsoBought/alsoViewed/related 等关联 ASIN（兼容 1.3+ 版本）。
-    ✅ 仅使用 asins=[...] 调用，确保兼容你当前版本 (1.3.15)
+    ✅ 直接使用 Keepa REST API，不依赖第三方 keepa SDK。兼容性最好。
+    返回：([ASIN...], 错误/提示消息或 None)
     """
-    try:
-        import keepa
-    except Exception:
-        return [], "Keepa SDK 未安装（requirements.txt 需包含 keepa>=1.3.0），已回退 HTML 解析模式。"
-
     if not api_key:
         return [], "未检测到 Keepa API Key，已回退 HTML 解析模式。"
 
+    domain_map = {
+        "amazon.co.uk": 2,
+        "amazon.com": 1,
+        "amazon.de": 3,
+        "amazon.fr": 8,
+        "amazon.it": 10,
+        "amazon.es": 9
+    }
+    dom = domain_map.get(domain, 2)
+
+    url = "https://api.keepa.com/product"
+    params = {
+        "key": api_key,
+        "domain": dom,
+        "asin": asin,
+        "history": 0
+    }
+
     try:
-        api = keepa.Keepa(api_key)
-        domain_map = {
-            "amazon.co.uk": 2,
-            "amazon.com": 1,
-            "amazon.de": 3,
-            "amazon.fr": 8,
-            "amazon.it": 10,
-            "amazon.es": 9
-        }
-        dom = domain_map.get(domain, 2)
+        r = requests.get(url, params=params, timeout=25)
+        data = r.json()
 
-        # ✅ 最稳定的调用方式
-        products = api.query(asins=[asin], domain=dom, history=False)
+        if "error" in data and data["error"]:
+            # 返回 Keepa 的错误信息
+            return [], f"Keepa API 错误: {data['error']}"
 
-        if not products:
-            return [], "Keepa 未返回产品，已回退 HTML 解析模式。"
+        if "products" not in data or not data["products"]:
+            return [], "Keepa 返回为空，可能 ASIN 无数据/错误或数据不足。"
 
-        # 统一取第一个产品
-        p = products[0] if isinstance(products, list) else products
-
+        p = data["products"][0]
         related = set()
+
         for k in ("alsoBought", "alsoViewed", "frequentlyBoughtTogether", "related"):
-            arr = p.get(k) or []
-            for x in arr:
+            for x in p.get(k, []) or []:
                 xu = str(x).upper()
                 if re.fullmatch(r"B0[A-Z0-9]{8}", xu):
                     related.add(xu)
@@ -182,14 +186,14 @@ def _keepa_fetch_related(asin, domain="amazon.co.uk", api_key=None, max_items=20
         out = list(related)[:max_items]
 
         if not out:
-            return out, "Keepa 已连接，但未返回关联 ASIN（可能是新品或无数据）。"
+            return out, "Keepa 已连接，但未返回关联 ASIN（可能是新品或数据不足）。"
 
         return out, None
 
     except Exception as e:
-        return [], f"Keepa 查询失败（{e}），已回退 HTML 解析模式。"
+        return [], f"Keepa API 请求失败：{e}"
 
-# ----------------- UI -----------------
+# ------------- UI -------------
 with st.container():
     cols = st.columns([1,1,1,1])
     with cols[0]:
@@ -199,9 +203,8 @@ with st.container():
     with cols[2]:
         max_items = st.number_input("最多抓取数量", 10, 500, 120, 10)
     with cols[3]:
-        prefer_keepa = st.toggle("优先使用 Keepa", value=True, help="需在 Secrets 配置 KEEPA_API_KEY 或 [keepa].api_key；无则自动回退 HTML 解析。")
+        prefer_keepa = st.toggle("优先使用 Keepa (REST)", value=True, help="需在 Secrets 配置 KEEPA_API_KEY 或 [keepa].api_key；无则自动回退 HTML 解析。")
 
-# 小提示显示密钥状态（可注释掉）
 st.caption(f"🔐 Keepa Key 状态：{'✅ 已检测到' if KEEPA_KEY else '❌ 未配置，将使用 HTML 回退'}")
 
 if st.button("🚀 开始抓取", use_container_width=True):
@@ -211,17 +214,18 @@ if st.button("🚀 开始抓取", use_container_width=True):
         st.stop()
     seed_asin = seed_asin.upper()
 
-    related_asins, keepa_msg = [], None
+    related_asins, msg = [], None
 
-    # 1) Keepa 优先
-    if prefer_keepa:
-        related_asins, keepa_msg = _keepa_fetch_related(seed_asin, domain=domain, api_key=KEEPA_KEY, max_items=max_items)
-        if keepa_msg:
-            st.warning(keepa_msg)
+    # 1) Keepa REST 优先
+    if prefer_keepa and KEEPA_KEY:
+        with st.status("🔗 正在通过 Keepa REST 获取关联 ASIN …", expanded=False):
+            related_asins, msg = _keepa_fetch_related_rest(seed_asin, domain=domain, api_key=KEEPA_KEY, max_items=max_items)
+            if msg:
+                st.write(msg)
 
     # 2) 回退：HTML 解析详情页推荐位
     if not related_asins:
-        with st.status("🔎 正在解析竞品详情页的推荐位 …", expanded=False):
+        with st.status("🔎 正在解析竞品详情页推荐位（HTML 回退）…", expanded=False):
             related_asins = _scrape_related_asins_from_dp(seed_asin, domain=domain, max_items=max_items)
             st.write(f"找到候选 ASIN：{len(related_asins)}")
 
@@ -254,4 +258,4 @@ if st.button("🚀 开始抓取", use_container_width=True):
     )
 
 st.markdown("---")
-st.caption("提示：未配置 Keepa 时将使用 HTML 回退，可能受页面结构影响抓取率较低；建议在 Secrets 配置 Keepa 提升稳定性与覆盖率。")
+st.caption("提示：Keepa REST 更稳定，不受第三方 SDK 影响；未配置 Keepa 时将使用 HTML 回退，抓取率可能受页面结构影响。")
