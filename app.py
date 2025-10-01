@@ -10,6 +10,9 @@ import streamlit as st
 from bs4 import BeautifulSoup
 from datetime import datetime
 
+import keepa
+st.write("Keepa 版本：", keepa.__version__)
+
 st.set_page_config(page_title="Competitor ASIN Grabber", layout="wide")
 st.title("🕵️ Competitor ASIN Grabber")
 st.caption("""
